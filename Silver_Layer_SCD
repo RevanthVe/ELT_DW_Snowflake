@@ -1,0 +1,173 @@
+create schema silver;
+
+-- Create Schemas of each table and add END_TIME and CURRENT_FLAG columns for SCD Type 2
+create or replace table silver.stores_scd("STORE_ID" TEXT not null unique primary key,
+"STORE_NAME" TEXT,
+"LAST_MODIFIED" TIMESTAMP_NTZ,
+"END_TIME" TIMESTAMP_NTZ,
+"CURRENT_FLAG" BOOLEAN
+);
+
+create or replace table silver.dimdates_scd("Id" NUMBER(6, 0) not null unique primary key,
+"Date" DATE,
+"DateLongDescription" TEXT,
+"DateShortDescription" TEXT,
+"DayLongName" TEXT,
+"DayShortName" TEXT,
+"MonthLongName" TEXT,
+"MonthShortName" TEXT,
+"CalendarDay" NUMBER(3, 0),
+"CalendarWeek" NUMBER(2, 0),
+"CalendarWeekStartDateId" TEXT,
+"CalendarWeekEndDateId" TEXT,
+"CalendarDayInWeek" NUMBER(1, 0),
+"CalendarMonth" NUMBER(2, 0),
+"CalendarMonthStartDateId" NUMBER(6, 0),
+"CalendarMonthEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInMonth" NUMBER(2, 0),
+"CalendarDayInMonth" NUMBER(2, 0),
+"CalendarQuarter" NUMBER(1, 0),
+"CalendarQuarterStartDateId" NUMBER(6, 0),
+"CalendarQuarterEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInQuarter" NUMBER(2, 0),
+"CalendarDayInQuarter" NUMBER(2, 0),
+"CalendarYear" NUMBER(4, 0),
+"CalendarYearStartDateId" NUMBER(6, 0),
+"CalendarYearEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInYear" NUMBER(3, 0),
+"FiscalDay" NUMBER(1, 0),
+"FiscalWeek" NUMBER(1, 0),
+"FiscalWeekStartDateId" NUMBER(1, 0),
+"FiscalWeekEndDateId" NUMBER(1, 0),
+"FiscalDayInWeek" NUMBER(1, 0),
+"FiscalMonth" NUMBER(2, 0),
+"FiscalMonthStartDateId" NUMBER(6, 0),
+"FiscalMonthEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInMonth" NUMBER(2, 0),
+"FiscalDayInMonth" NUMBER(2, 0),
+"FiscalQuarter" NUMBER(1, 0),
+"FiscalQuarterStartDateId" NUMBER(6, 0),
+"FiscalQuarterEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInQuarter" NUMBER(2, 0),
+"FiscalDayInQuarter" NUMBER(2, 0),
+"FiscalYear" NUMBER(4, 0),
+"FiscalYearStartDateId" NUMBER(6, 0),
+"FiscalYearEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInYear" NUMBER(3, 0),
+"LAST_MODIFIED" TIMESTAMP_NTZ,
+"END_TIME" TIMESTAMP_NTZ,
+"CURRENT_FLAG" BOOLEAN);
+
+CREATE OR REPLACE TABLE silver.sales_scd (
+    TRANSACTION_ID NUMBER(5,0) NOT NULL UNIQUE PRIMARY KEY,
+    T_DATE DATE,
+    QUANTITY NUMBER(2,0),
+    FK_CUSTOMER_ID TEXT,
+    FK_PRODUCT_ID TEXT,
+    FK_STORE_ID TEXT,
+    "LAST_MODIFIED" TIMESTAMP_NTZ,
+    "END_TIME" TIMESTAMP_NTZ,
+    "CURRENT_FLAG" BOOLEAN,
+    FOREIGN KEY (FK_CUSTOMER_ID) REFERENCES customers_scd(CUSTOMER_ID),
+    FOREIGN KEY (FK_PRODUCT_ID) REFERENCES products_scd(PRODUCT_ID),
+    FOREIGN KEY (FK_STORE_ID) REFERENCES stores_scd(STORE_ID)
+);
+
+create or replace table silver.customers_scd("CUSTOMER_ID" TEXT not null unique primary key,
+"CUSTOMER_NAME" TEXT,
+"DATE_OF_BIRTH" DATE,
+"LAST_MODIFIED" TIMESTAMP_NTZ,
+"END_TIME" TIMESTAMP_NTZ,
+"CURRENT_FLAG" BOOLEAN);
+
+create or replace table silver.products_scd ("PRODUCT_ID" TEXT not null unique primary key,
+"PRODUCT_NAME" TEXT,
+"PRICE" NUMBER(4, 2),
+"LAST_MODIFIED" TIMESTAMP_NTZ,
+"END_TIME" TIMESTAMP_NTZ,
+"CURRENT_FLAG" BOOLEAN);
+
+-- Create streams to catch changes 
+create or replace stream customers_stm on table bronze.customers;
+create or replace stream products_stm on table bronze.products;
+create or replace stream sales_stm on table bronze.sales;
+create or replace stream stores_stm on table bronze.stores;
+create or replace stream dimdates_stm on table bronze.dimdates;
+
+-- Create views with change_tracking for merge into operation
+create or replace view stores_brz_view as select * from bronze.stores;
+alter view stores_brz_view SET CHANGE_TRACKING = TRUE; 
+
+-- Merge into operation in Python
+CREATE OR REPLACE PROCEDURE load_silver_scd()
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.8'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+AS
+$$
+import snowflake.snowpark as snowpark
+
+def main(session: snowpark.Session): 
+    # Your code goes here, inside the "main" handler.
+    
+    def get_column_info(table_name):
+    # Query to retrieve column names and data types from the information schema
+        query = f"""
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = 'SILVER' AND TABLE_NAME = '{table_name}'
+        """
+        column_info = session.sql(query).collect()
+        return [row[0] for row in column_info]
+        
+    def generate_merge_statement(silver_table,common_columns,stream,view):
+        merge_statement = f"MERGE INTO {silver_table} AS tgt\n"
+        merge_statement += f"USING {stream} AS src\n"
+        
+        # only include columns that end with "ID"
+        id_columns = [column for column in common_columns if column.endswith("ID")]
+        on_conditions = [f"tgt.{column} = src.{column}" for column in id_columns]
+        on_condition_str = " AND ".join(on_conditions)
+        merge_statement += "ON " + on_condition_str + "\n"
+
+        merge_statement += "WHEN MATCHED AND src.metadata$action = 'DELETE' THEN UPDATE SET tgt.end_time = CURRENT_TIMESTAMP(), tgt.current_flag = 'False'\n"
+
+
+        merge_statement += "WHEN NOT MATCHED AND src.metadata$action = 'INSERT' THEN INSERT (\n"
+        insert_columns = [f"tgt.{column}" for column in common_columns]
+        insert_column_str = ",\n".join(insert_columns)
+        merge_statement += insert_column_str + "\n) VALUES (\n"
+
+        insert_values = []
+        for column in common_columns:
+            insert_values.append(f"src.{column}")
+        insert_value_str = ",\n".join(insert_values)
+        merge_statement += insert_value_str + "\n);\n"
+    
+        try:
+            result = session.sql(merge_statement).collect()
+            print(f"Merged {silver_table} successfully")
+            return result
+        except Exception as e:
+            print(f"Error executing merge statement for {silver_table}:")
+            print(f"Merge Statement: \n{merge_statement}")
+            print(f"Error Message: {str(e)}")
+            return None
+
+    streams = ['CUSTOMERS_STM','DIMDATES_STM','PRODUCTS_STM','SALES_STM','STORES_STM']
+    views = ['CUSTOMERS_BRZ_VIEW','DIMDATES_BRZ_VIEW','PRODUCTS_BRZ_VIEW','SALES_BRZ_VIEW','STORES_BRZ_VIEW']
+    silver_tables = ['CUSTOMERS_SCD','DIMDATES_SCD','PRODUCTS_SCD','SALES_SCD','STORES_SCD']
+    
+    # Iterate over Streams, Views and Silver table pairs
+    common_columns = []
+    for view, silver_table, stream in zip(views, silver_tables, streams):
+        # Get the column info for the Views and Silver tables
+        view_info = get_column_info(view)
+        silver_column_info =get_column_info(silver_table)
+        
+        # Get the common columns between Streams and Silver tables
+        common_columns = [col for col in view_info if col in silver_column_info]
+        generate_merge_statement(silver_table,common_columns,stream,view)
+$$;
