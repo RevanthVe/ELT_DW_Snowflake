@@ -1,0 +1,227 @@
+-- Creating external stage for s3 bucket
+create or replace storage integration sst_object
+ type = external_stage
+ storage_provider = s3
+  enabled = true
+  storage_aws_role_arn ='arn:aws:iam::132465466465:role/role_name'
+ storage_allowed_locations = ('<insert s3 bucket url here>');
+
+desc integration sst_object
+
+-- Create file format specific to source data
+create or replace file format csv_format1
+TYPE = 'CSV'
+FIELD_DELIMITER = ','
+RECORD_DELIMITER= '\n'
+FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+PARSE_HEADER = true
+ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+--SKIP_HEADER = 1;
+
+alter stage sst_stage1 set
+    storage_integration = sst_object
+    url = "<insert s3 bucket url here>"
+    file_format = csv_format1;
+
+ls @sst_stage1
+
+-- To get schemas of tables in external stage
+SELECT GENERATE_COLUMN_DESCRIPTION
+(ARRAY_AGG (OBJECT_CONSTRUCT(*) ) WITHIN GROUP (ORDER BY ORDER_ID), 'table')
+AS COLUMNS
+FROM TABLE (INFER_SCHEMA (
+LOCATION=> '@sst_stage1/stores.csv',
+file_format=> 'csv_format1'));
+
+-- creating dimdates table
+create or replace table dimdates("Id" NUMBER(6, 0),
+"Date" DATE,
+"DateLongDescription" TEXT,
+"DateShortDescription" TEXT,
+"DayLongName" TEXT,
+"DayShortName" TEXT,
+"MonthLongName" TEXT,
+"MonthShortName" TEXT,
+"CalendarDay" NUMBER(3, 0),
+"CalendarWeek" NUMBER(2, 0),
+"CalendarWeekStartDateId" TEXT,
+"CalendarWeekEndDateId" TEXT,
+"CalendarDayInWeek" NUMBER(1, 0),
+"CalendarMonth" NUMBER(2, 0),
+"CalendarMonthStartDateId" NUMBER(6, 0),
+"CalendarMonthEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInMonth" NUMBER(2, 0),
+"CalendarDayInMonth" NUMBER(2, 0),
+"CalendarQuarter" NUMBER(1, 0),
+"CalendarQuarterStartDateId" NUMBER(6, 0),
+"CalendarQuarterEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInQuarter" NUMBER(2, 0),
+"CalendarDayInQuarter" NUMBER(2, 0),
+"CalendarYear" NUMBER(4, 0),
+"CalendarYearStartDateId" NUMBER(6, 0),
+"CalendarYearEndDateId" NUMBER(6, 0),
+"CalendarNumberOfDaysInYear" NUMBER(3, 0),
+"FiscalDay" NUMBER(1, 0),
+"FiscalWeek" NUMBER(1, 0),
+"FiscalWeekStartDateId" NUMBER(1, 0),
+"FiscalWeekEndDateId" NUMBER(1, 0),
+"FiscalDayInWeek" NUMBER(1, 0),
+"FiscalMonth" NUMBER(2, 0),
+"FiscalMonthStartDateId" NUMBER(6, 0),
+"FiscalMonthEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInMonth" NUMBER(2, 0),
+"FiscalDayInMonth" NUMBER(2, 0),
+"FiscalQuarter" NUMBER(1, 0),
+"FiscalQuarterStartDateId" NUMBER(6, 0),
+"FiscalQuarterEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInQuarter" NUMBER(2, 0),
+"FiscalDayInQuarter" NUMBER(2, 0),
+"FiscalYear" NUMBER(4, 0),
+"FiscalYearStartDateId" NUMBER(6, 0),
+"FiscalYearEndDateId" NUMBER(6, 0),
+"FiscalNumberOfDaysInYear" NUMBER(3, 0));
+
+select * from products;
+
+-- creating customers table
+create or replace table customers(
+"CUSTOMER_ID" TEXT,
+"CUSTOMER_NAME" TEXT,
+"DATE_OF_BIRTH" DATE
+);
+
+-- creating products table
+create or replace table products("PRODUCT_ID" TEXT,
+"PRODUCT_NAME" TEXT,
+"PRICE" NUMBER(4, 2));
+
+-- creating sales table
+create or replace table sales("TRANSACTION_ID" NUMBER(5, 0),
+"PRODUCT_ID" TEXT,
+"CUSTOMER_ID" TEXT,
+"STORE_ID" TEXT,
+"T_DATE" DATE,
+"QUANTITY" NUMBER(2, 0));
+
+-- creating stores table
+create or replace table stores("STORE_ID" TEXT,
+"STORE_NAME" TEXT);
+
+--adding timestamp column to tables, replace table name to the desired
+ALTER TABLE stores ADD COLUMN last_modified TIMESTAMP_NTZ;
+
+UPDATE stores SET last_modified = CURRENT_TIMESTAMP();
+
+-- Create stored procedures to load data daily
+CREATE OR REPLACE PROCEDURE load_latest_data()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    COPY INTO dimdates
+    FROM @sst_stage1/dimdates.csv
+    FILE_FORMAT = csv_format1
+    MATCH_BY_COLUMN_NAME = CASE_SENSITIVE;
+
+    UPDATE dimdates
+    SET last_modified = CURRENT_TIMESTAMP()
+    WHERE last_modified IS NULL;
+
+    COPY INTO customers
+    FROM @sst_stage1/customers.csv
+    FILE_FORMAT = csv_format1
+    MATCH_BY_COLUMN_NAME = CASE_SENSITIVE;
+
+    UPDATE customers
+    SET last_modified = CURRENT_TIMESTAMP()
+    WHERE last_modified IS NULL;
+
+    COPY INTO products
+    FROM @sst_stage1/products.csv
+    FILE_FORMAT = csv_format1
+    MATCH_BY_COLUMN_NAME = CASE_SENSITIVE;
+
+    UPDATE products
+    SET last_modified = CURRENT_TIMESTAMP()
+    WHERE last_modified IS NULL;
+    
+    COPY INTO sales
+    FROM
+    @sst_stage1/sales.csv
+    FILE_FORMAT = csv_format1
+    MATCH_BY_COLUMN_NAME = CASE_SENSITIVE;
+
+    UPDATE sales
+    SET last_modified = CURRENT_TIMESTAMP()
+    WHERE last_modified IS NULL;
+
+    COPY INTO stores
+    FROM @sst_stage1/stores.csv
+    FILE_FORMAT = csv_format1
+    MATCH_BY_COLUMN_NAME = CASE_SENSITIVE;
+
+    UPDATE stores
+    SET last_modified = CURRENT_TIMESTAMP()
+    WHERE last_modified IS NULL;
+
+    RETURN 'Latest data loaded successfully';
+END;
+$$;
+
+-- Scheduling task to load latest daily data
+CREATE OR REPLACE TASK load_latest_data_task
+WAREHOUSE = compute_wh
+SCHEDULE = 'USING CRON 0 6 * * * America/Chicago'
+AS
+CALL load_latest_data();
+
+-- SELECT SYSTEM$TASK_DEPENDENTS_ENABLE('load_latest_data_task');
+
+-- ALTER TASK SST_S3.PUBLIC.LOAD_LATEST_DATA_TASK SUSPEND;
+
+-- Scheduling task to delete oldest one day data 
+CREATE OR REPLACE PROCEDURE delete_oldest_data()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    delete from dimdates
+    where last_modified < DATEADD(DAY,-7,CURRENT_TIMESTAMP);
+    
+    delete from customers
+    where last_modified < DATEADD(DAY,-7,CURRENT_TIMESTAMP);
+    
+    delete from products
+    where last_modified < DATEADD(DAY,-7,CURRENT_TIMESTAMP);
+    
+    delete from sales
+    where last_modified < DATEADD(DAY,-7,CURRENT_TIMESTAMP);
+    
+    delete from stores
+    where last_modified < DATEADD(DAY,-7,CURRENT_TIMESTAMP);
+
+    RETURN 'Old data deleted successfully';
+END;
+$$;
+
+CREATE OR REPLACE TASK delete_oldest_data_task
+WAREHOUSE = compute_wh
+AFTER load_latest_data_task
+AS
+CALL delete_oldest_data();
+
+-- Task to populate bronze layer tables
+CREATE OR REPLACE TASK populate_bronze_layer_task
+WAREHOUSE = compute_wh
+AFTER public.load_latest_data_task
+AS
+CALL bronze.populate_bronze_layer();
+
+-- Task to populate silver layer tables
+CREATE OR REPLACE TASK load_silver_scd_tables
+WAREHOUSE = compute_wh
+AFTER public.populate_bronze_layer_task
+AS
+CALL silver.load_silver_scd();
