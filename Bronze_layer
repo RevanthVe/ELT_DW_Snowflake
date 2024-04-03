@@ -1,0 +1,40 @@
+-- Create bronze schema
+create or replace schema bronze;
+
+-- Create a stored procedure for transformation and call it using scheduled task
+CREATE OR REPLACE PROCEDURE populate_bronze_layer()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    -- Create a new table in the bronze layer for customers
+    CREATE OR REPLACE TABLE bronze.sales AS
+    SELECT DISTINCT *
+    FROM public.sales ps
+    WHERE ps.customer_id IN (SELECT pc.customer_id FROM public.customers pc)
+    AND DATE(last_modified) = (SELECT MAX(DATE(last_modified)) FROM public.sales);
+  
+    CREATE OR REPLACE TABLE bronze.dimdates AS
+    SELECT DISTINCT *
+    FROM public.dimdates
+    WHERE DATE(last_modified) = (SELECT MAX(DATE(last_modified)) FROM public.dimdates);
+
+    CREATE OR REPLACE TABLE bronze.customers AS
+    SELECT DISTINCT *
+    FROM public.customers
+    WHERE DATE(last_modified) = (SELECT MAX(DATE(last_modified)) FROM public.customers);
+
+    CREATE OR REPLACE TABLE bronze.stores AS
+    SELECT DISTINCT *
+    FROM public.stores
+    WHERE DATE(last_modified) = (SELECT MAX(DATE(last_modified)) FROM public.stores);
+
+    CREATE OR REPLACE TABLE bronze.products AS
+    SELECT DISTINCT *
+    FROM public.products
+    WHERE DATE(last_modified) = (SELECT MAX(DATE(last_modified)) FROM public.dimdates);
+    
+    RETURN 'Bronze layer tables created';
+END;
+$$;
